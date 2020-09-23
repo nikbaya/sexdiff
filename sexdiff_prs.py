@@ -24,27 +24,37 @@ import pandas as pd
 from scipy import stats
 from datetime import datetime as dt
 import argparse
+from ukbb_pan_ancestry.resources.genotypes import get_ukb_imputed_data # https://github.com/atgu/ukbb_pan_ancestry/tree/master
 #import requests
 #url = 'https://raw.githubusercontent.com/nikbaya/split/master/gwas.py'
 #r = requests.get(url).text
 #exec(r)
 #gwas=gwas
-hl.init(log='/tmp/hail.log')
-
-parser = argparse.ArgumentParser(add_help=False)
-parser.add_argument('--run_gwas',action='store_true',default=False,help="whether to run GWAS")
-parser.add_argument('--calc_prs',action='store_true',default=False,help="whether to calculate PRS")
-parser.add_argument('--phen_prs_reg',action='store_true',default=False,help="whether to run phenotype ~ PRS + covs regression")
-
-
-args = parser.parse_args()
-
-run_gwas = args.run_gwas
-calc_prs = args.calc_prs
-phen_prs_reg = args.phen_prs_reg
 
 wd= 'gs://nbaya/sexdiff/prs/'
 
+def get_mt(overwrite=True):
+    mt_path = 'gs://ukbb-temp-30day/nbaya/ukb31063.hm3_variants.gwas_samples.mt'
+    if hl.hadoop_is_file(f'{mt_path}/_SUCCESS'):
+        mt = hl.read_matrix_table(mt_path)
+    else:
+        # variants = hl.import_table('gs://nbaya/hapmap3_variants.tsv.gz', force=True) # download here: https://github.com/nikbaya/split/blob/master/hapmap3_variants.tsv.gz
+        # variants = variants.key_by(**hl.parse_variant(variants.v))
+        # mt = get_ukb_imputed_data('all', variant_list = variants, entry_fields = ('dosage', )) # 'all' = autosomes only
+        # # print(mt.count()) # (1089172, 487409)        
+        # # mt = mt.checkpoint(mt_path.replace('nbaya/','nbaya/tmp-'), overwrite=overwrite)
+        # mt = mt.checkpoint(mt_path.replace('nbaya/','nbaya/tmp-'), _read_if_exists=True)
+        mt = hl.read_matrix_table(mt_path.replace('nbaya/','nbaya/tmp-'))
+        mt = mt.repartition(1000)
+        withdrawn = hl.read_table('gs://ukb31063/ukb31063.withdrawn_samples.ht')
+        mt = mt.anti_join_cols(withdrawn)
+        print(mt.count())
+        covs = hl.read_table('gs://ukb31063/ukb31063.neale_gwas_covariates.both_sexes.ht')
+        mt = mt.annotate_cols(**covs[mt.s])
+        mt = mt.filter_cols(hl.is_defined(mt.PC1))
+        print(mt.count())
+        mt = mt.checkpoint(mt_path, overwrite=overwrite)
+    return mt
 
 def remove_n_individuals(mt, n_remove_per_sex, phen, phen_tb_dict, sexes = ['females','males'], seed=None):
     r'''
@@ -428,6 +438,19 @@ def prs_phen_reg(test_mt, phen, sex, n_remove, prune, percentiles, seed, use_sex
 
 
 if __name__ == "__main__":
+    
+    hl.init(log='/tmp/hail.log')
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--run_gwas',action='store_true',default=False,help="whether to run GWAS")
+    parser.add_argument('--calc_prs',action='store_true',default=False,help="whether to calculate PRS")
+    parser.add_argument('--phen_prs_reg',action='store_true',default=False,help="whether to run phenotype ~ PRS + covs regression")
+    args = parser.parse_args()
+    
+    run_gwas = args.run_gwas
+    calc_prs = args.calc_prs
+    phen_prs_reg = args.phen_prs_reg
+    
     phen_dict = {
 #                '50_irnt':['Standing height', 73178],
 #                '23105_irnt':['Basal metabolic rate', 35705],
@@ -446,63 +469,61 @@ if __name__ == "__main__":
                 '23127_raw':['Trunk fat percentage (raw)', 73178],
             }
     
-    variant_set = 'hm3'
     n_remove_per_sex = 10e3
     prune=True
     percentiles = [1,0.50,0.10]
     use_sex_spec_irnt = True # whether to use sex-specific phenotype information when comparing against PRS
     
-    mt0 = hl.read_matrix_table(f'gs://nbaya/split/ukb31063.{variant_set}_variants.gwas_samples_repart.mt')
+    mt0 = get_mt()
     
-    phen_tb_dict = {'female':None,'male':None,'both_sexes':None}
-    for sex in ['female','male','both_sexes']:
-        phen_tb_dict[sex] =  hl.import_table(f'gs://ukb31063/ukb31063.PHESANT_January_2019.{sex}.tsv.bgz',
-                           missing='',impute=True,types={'s': hl.tstr}, key='s')
+    # phen_tb_dict = {'female':None,'male':None,'both_sexes':None}
+    # for sex in ['female','male','both_sexes']:
+    #     phen_tb_dict[sex] =  hl.import_table(f'gs://ukb31063/ukb31063.PHESANT_January_2019.{sex}.tsv.bgz',
+    #                        missing='',impute=True,types={'s': hl.tstr}, key='s')
 
-    
-    for phen, phen_desc in phen_dict.items():
+    # for phen, phen_desc in phen_dict.items():
 
-        if run_gwas:
-            mt_both, mt_f, mt_m, seed = remove_n_individuals(mt=mt0, n_remove_per_sex=n_remove_per_sex, 
-                                                             phen=phen, phen_tb_dict=phen_tb_dict, 
-                                                             sexes = ['female','male'], seed=phen_dict[phen][1])
-            for mt_tmp, sex in [(mt_f,'female'), (mt_m,'male'), (mt_both,'both_sexes')]:            
-                gwas_path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz'
-    #            try:
-    #                subprocess.check_output([f'gsutil', 'ls', gwas_path ]) != None
-    #            except:
-                print(f'\n... Running {sex} GWAS on "{phen_dict[phen][0]}" (code: {phen}) ...\n')
-                gwas(mt=mt_tmp, 
-                     x=mt_tmp.dosage, 
-                     y=mt_tmp['phen'], 
-                     path_to_save=gwas_path,
-                     is_std_cov_list=True)                
+    #     if run_gwas:
+    #         mt_both, mt_f, mt_m, seed = remove_n_individuals(mt=mt0, n_remove_per_sex=n_remove_per_sex, 
+    #                                                          phen=phen, phen_tb_dict=phen_tb_dict, 
+    #                                                          sexes = ['female','male'], seed=phen_dict[phen][1])
+    #         for mt_tmp, sex in [(mt_f,'female'), (mt_m,'male'), (mt_both,'both_sexes')]:            
+    #             gwas_path = wd+f'{phen}.gwas.{sex}.n_remove_{n_remove_per_sex}.seed_{seed}.tsv.bgz'
+    # #            try:
+    # #                subprocess.check_output([f'gsutil', 'ls', gwas_path ]) != None
+    # #            except:
+    #             print(f'\n... Running {sex} GWAS on "{phen_dict[phen][0]}" (code: {phen}) ...\n')
+    #             gwas(mt=mt_tmp, 
+    #                  x=mt_tmp.dosage, 
+    #                  y=mt_tmp['phen'], 
+    #                  path_to_save=gwas_path,
+    #                  is_std_cov_list=True)                
 
-        if calc_prs:
-            mt_sex0 = get_test_mt(mt_all=mt0, phen=phen, sex='both_sexes', seed=phen_dict[phen][1])
-            for sex in ['female','male','both_sexes']:
+    #     if calc_prs:
+    #         mt_sex0 = get_test_mt(mt_all=mt0, phen=phen, sex='both_sexes', seed=phen_dict[phen][1])
+    #         for sex in ['female','male','both_sexes']:
                 
-                prs(mt=mt_sex0, phen=phen, sex=sex, n_remove=n_remove_per_sex,
-                    prune=prune, percentiles=percentiles, seed=phen_dict[phen][1], count=False)
+    #             prs(mt=mt_sex0, phen=phen, sex=sex, n_remove=n_remove_per_sex,
+    #                 prune=prune, percentiles=percentiles, seed=phen_dict[phen][1], count=False)
             
-        if phen_prs_reg:
-            mt_sex0 = get_test_mt(mt_all=mt0, phen=phen, sex='both_sexes', seed=phen_dict[phen][1])
-            for sex in ['female','male','both_sexes']:
+    #     if phen_prs_reg:
+    #         mt_sex0 = get_test_mt(mt_all=mt0, phen=phen, sex='both_sexes', seed=phen_dict[phen][1])
+    #         for sex in ['female','male','both_sexes']:
                 
-                if use_sex_spec_irnt and sex!='both_sexes' and 'irnt' in phen:
-                    mt_sex1 = annotate_phen(tb=mt_sex0, phen=phen, sex='female', 
-                                           phen_tb_dict=phen_tb_dict, filter_to_phen=False)
-                    mt_sex2 = mt_sex1.rename({'phen':'phen_female'})
-                    mt_sex3 = annotate_phen(tb=mt_sex2, phen=phen, sex='male', 
-                                           phen_tb_dict=phen_tb_dict, filter_to_phen=False)
-                    mt_sex4 = mt_sex3.rename({'phen':'phen_male'})
-                    mt_sex = mt_sex4.annotate_cols(phen = hl.or_else(mt_sex4.phen_female, mt_sex4.phen_male))
+    #             if use_sex_spec_irnt and sex!='both_sexes' and 'irnt' in phen:
+    #                 mt_sex1 = annotate_phen(tb=mt_sex0, phen=phen, sex='female', 
+    #                                        phen_tb_dict=phen_tb_dict, filter_to_phen=False)
+    #                 mt_sex2 = mt_sex1.rename({'phen':'phen_female'})
+    #                 mt_sex3 = annotate_phen(tb=mt_sex2, phen=phen, sex='male', 
+    #                                        phen_tb_dict=phen_tb_dict, filter_to_phen=False)
+    #                 mt_sex4 = mt_sex3.rename({'phen':'phen_male'})
+    #                 mt_sex = mt_sex4.annotate_cols(phen = hl.or_else(mt_sex4.phen_female, mt_sex4.phen_male))
                     
-                else:
-                    mt_sex = annotate_phen(tb=mt_sex0, phen=phen, sex='both_sexes', phen_tb_dict=phen_tb_dict) #use the both sexes irnt
+    #             else:
+    #                 mt_sex = annotate_phen(tb=mt_sex0, phen=phen, sex='both_sexes', phen_tb_dict=phen_tb_dict) #use the both sexes irnt
                     
-                prs_phen_reg(test_mt=mt_sex, phen=phen, sex=sex, n_remove=n_remove_per_sex, 
-                             prune=prune, percentiles=percentiles, seed=phen_dict[phen][1],
-                             use_sex_spec_irnt=use_sex_spec_irnt)
+    #             prs_phen_reg(test_mt=mt_sex, phen=phen, sex=sex, n_remove=n_remove_per_sex, 
+    #                          prune=prune, percentiles=percentiles, seed=phen_dict[phen][1],
+    #                          use_sex_spec_irnt=use_sex_spec_irnt)
 
 
